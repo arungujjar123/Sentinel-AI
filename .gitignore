@@ -1,0 +1,22 @@
+# Frontend (Next.js)
+/frontend/node_modules/
+/frontend/.next/
+/frontend/out/
+/frontend/.turbo/
+/frontend/tsconfig.tsbuildinfo
+
+# Local env files (do not commit secrets)
+/frontend/.env.local
+/frontend/.env.*.local
+
+# Root .env — docker-compose host-port overrides for this machine only
+# (see .env.example for what it's for)
+/.env
+
+# Python (scripts/)
+__pycache__/
+*.py[cod]
+
+# General
+.DS_Store
+Thumbs.db

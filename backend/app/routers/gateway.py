@@ -1,0 +1,326 @@
+import logging
+import time
+import uuid
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.db.database import get_db
+from app.models import ChatRequest, ChatResponse, MetaInfo, UsageInfo
+from app.services.api_keys import resolve_key
+from app.services.cache import check_cache
+from app.services.circuit_breaker import registry as cb  # ← new
+from app.services.providers import call_gemini, call_groq
+from app.services.rate_limiter import limiter
+
+# Import Celery tasks (fire-and-forget post-processing)
+from app.tasks import post_process_task, touch_api_key_task
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+def _truncate(s: str | None, n: int = 280) -> str | None:
+    if not s:
+        return None
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    return s[: n - 1] + "…"
+
+
+def _prompt_preview(messages: list[dict]) -> str | None:
+    # Prefer the last user message (what engineers usually want to inspect).
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return _truncate(m.get("content"))
+    # Fallback: last message content.
+    if messages and isinstance(messages[-1].get("content"), str):
+        return _truncate(messages[-1].get("content"))
+    return None
+
+
+async def verify_api_key(
+    response: Response,
+    authorization: str = Header(...),
+    db: AsyncSession = Depends(get_db),
+) -> str:
+    """
+    Resolves the bearer token and enforces its rate limit.
+
+    Two accepted forms:
+      - The master admin key (settings.api_key) — always valid, never
+        rate-limited. Kept for backward compatibility and bootstrapping.
+      - A per-tenant key (see app/services/api_keys.py) — looked up via a
+        Redis-cached hash lookup against the api_keys table, then checked
+        against its own requests-per-minute limit.
+
+    Returns an identity string ("master" or the key's id) for callers that
+    want to know who made the request.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid auth format")
+    token = authorization.replace("Bearer ", "")
+
+    if token == settings.api_key:
+        return "master"
+
+    key_data = await resolve_key(db=db, raw_key=token)
+    if key_data is None:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    limit_result = await limiter.check(key_hash=key_data["key_hash"], limit=key_data["rate_limit"])
+    response.headers["X-RateLimit-Limit"] = str(limit_result.limit)
+    response.headers["X-RateLimit-Remaining"] = str(limit_result.remaining)
+
+    if not limit_result.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded",
+            headers={
+                "X-RateLimit-Limit": str(limit_result.limit),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(limit_result.reset_seconds),
+                "Retry-After": str(limit_result.reset_seconds),
+            },
+        )
+
+    # Fire-and-forget — never block the request on a last_used write.
+    touch_api_key_task.delay(key_hash=key_data["key_hash"])
+    return key_data["id"]
+
+
+def verify_master_key(authorization: str = Header(...)) -> str:
+    """
+    Admin-only auth for API key management endpoints (routers/keys.py).
+    Accepts only the master key from settings — never a per-tenant key,
+    so a leaked tenant key can't be used to mint or revoke other keys.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid auth format")
+    token = authorization.replace("Bearer ", "")
+    if token != settings.api_key:
+        raise HTTPException(status_code=401, detail="Admin key required")
+    return token
+
+
+async def _try_provider(name: str, fn) -> dict | None:
+    """
+    Attempt a provider call with circuit breaker protection.
+    Returns result dict on success, None on any failure.
+    """
+    if not await cb.is_available(name):
+        logger.info("%s circuit is OPEN — skipping immediately", name)
+        return None
+
+    try:
+        result = await fn()
+        await cb.record_success(name)
+        return result
+
+    except httpx.TimeoutException:
+        logger.warning("%s TIMEOUT — recording circuit breaker failure", name)
+        await cb.record_failure(name)
+        return None
+
+    except httpx.HTTPStatusError as e:
+        status_code = e.response.status_code
+        logger.warning("%s returned HTTP %d — recording circuit breaker failure", name, status_code)
+        await cb.record_failure(name)   # ← record ALL HTTP errors now, not just some
+        return None                     # ← always return None, never re-raise
+
+    except Exception as e:
+        logger.error("%s unexpected error: %s", name, e)
+        await cb.record_failure(name)
+        return None
+
+
+@router.post("/v1/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+    _: str = Depends(verify_api_key),
+):
+    messages    = [m.model_dump() for m in request.messages]
+    request_id  = str(uuid.uuid4())
+    wall_start  = time.monotonic()
+    stage: dict[str, int] = {}
+    prompt_prev = _prompt_preview(messages)
+    fallback_from: str | None = None
+    status: str = "success"
+    error_type: str | None = None
+
+    # ── 1. Semantic cache check ───────────────────────────────────────
+    if not request.bypass_cache:
+        t_cache = time.monotonic()
+        cached = await check_cache(db=db, messages=messages)
+        stage["cache_check_ms"] = int((time.monotonic() - t_cache) * 1000)
+
+        if cached:
+            wall_latency = int((time.monotonic() - wall_start) * 1000)
+
+            # Fire background task — don't await DB/cache writes.
+            task_start = time.monotonic()
+            post_process_task.delay(
+                request_id=request_id,
+                provider=cached["provider"],
+                model=cached["model"],
+                input_tokens=cached["input_tokens"],
+                output_tokens=cached["output_tokens"],
+                cost_usd=0.0,
+                latency_ms=wall_latency,
+                cache_hit=True,
+                status="success",
+                error_type=None,
+                fallback_from=None,
+                messages=messages,
+                response=None,  # no response to cache — already cached
+                prompt_preview=prompt_prev,
+                response_preview=_truncate(cached.get("content")),
+            )
+            task_queue_ms = int((time.monotonic() - task_start) * 1000)
+            logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
+
+            if settings.log_stage_timings:
+                total_ms = int((time.monotonic() - wall_start) * 1000)
+                logger.info(
+                    "chat request timing",
+                    extra={
+                        "request_id": request_id, "cache_hit": True, "total_ms": total_ms,
+                        "cache_check_ms": stage.get("cache_check_ms"), "task_queue_ms": task_queue_ms,
+                    },
+                )
+
+            return ChatResponse(
+                id=request_id, content=cached["content"],
+                provider=cached["provider"], model=cached["model"],
+                usage=UsageInfo(input_tokens=cached["input_tokens"],
+                                output_tokens=cached["output_tokens"],
+                                cost_usd=0.0),
+                meta=MetaInfo(cache_hit=True, latency_ms=wall_latency,
+                              provider=cached["provider"], fallback=None),
+            )
+
+    # ── 2. Try Groq (with circuit breaker) ───────────────────────────
+    result = None
+
+    t_groq = time.monotonic()
+    result = await _try_provider(
+        "groq",
+        lambda: call_groq(
+            messages=messages, model=request.model,
+            max_tokens=request.max_tokens, temperature=request.temperature,
+        )
+    )
+    stage["groq_ms"] = int((time.monotonic() - t_groq) * 1000)
+
+    if result:
+        status = "success"
+
+    # ── 3. Try Gemini if Groq failed or was open ──────────────────────
+    if result is None:
+        fallback_from = "groq"
+        t_gemini = time.monotonic()
+        result = await _try_provider(
+            "gemini",
+            lambda: call_gemini(
+                messages=messages,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+            )
+        )
+        stage["gemini_ms"] = int((time.monotonic() - t_gemini) * 1000)
+        if result:
+            status = "fallback"
+
+    # ── 4. All providers failed ───────────────────────────────────────
+    if result is None:
+        task_start = time.monotonic()
+        post_process_task.delay(
+            request_id=request_id,
+            provider="none",
+            model=request.model,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.0,
+            latency_ms=int((time.monotonic() - wall_start) * 1000),
+            cache_hit=False,
+            status="error",
+            error_type="all_providers_failed",
+            fallback_from=fallback_from,
+            messages=messages,
+            response=None,
+            prompt_preview=prompt_prev,
+            response_preview=None,
+        )
+        task_queue_ms = int((time.monotonic() - task_start) * 1000)
+        logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
+
+        if settings.log_stage_timings:
+            total_ms = int((time.monotonic() - wall_start) * 1000)
+            logger.info(
+                "chat request timing",
+                extra={
+                    "request_id": request_id, "cache_hit": False, "status": "error", "total_ms": total_ms,
+                    "cache_check_ms": stage.get("cache_check_ms"), "groq_ms": stage.get("groq_ms"),
+                    "gemini_ms": stage.get("gemini_ms"), "task_queue_ms": task_queue_ms,
+                },
+            )
+        circuit_states = await cb.get_all_states()
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "All providers unavailable",
+                "circuit_states": circuit_states,
+            }
+        )
+
+    wall_latency = int((time.monotonic() - wall_start) * 1000)
+
+    # ── 5. Return response FIRST ─────────────────────────────────────
+    response_obj = ChatResponse(
+        id=request_id, content=result["content"],
+        provider=result["provider"], model=result["model"],
+        usage=UsageInfo(input_tokens=result["input_tokens"],
+                        output_tokens=result["output_tokens"],
+                        cost_usd=result["cost_usd"]),
+        meta=MetaInfo(cache_hit=False, latency_ms=wall_latency,
+                      provider=result["provider"], fallback=fallback_from),
+    )
+
+    # ── 6. Fire background task AFTER building response ──────────────
+    task_start = time.monotonic()
+    post_process_task.delay(
+        request_id=request_id,
+        provider=result["provider"],
+        model=result["model"],
+        input_tokens=result["input_tokens"],
+        output_tokens=result["output_tokens"],
+        cost_usd=result["cost_usd"],
+        latency_ms=wall_latency,
+        cache_hit=False,
+        status=status,
+        error_type=error_type,
+        fallback_from=fallback_from,
+        messages=messages,
+        response=result,
+        prompt_preview=prompt_prev,
+        response_preview=_truncate(result.get("content")),
+    )
+    task_queue_ms = int((time.monotonic() - task_start) * 1000)
+    logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
+
+    if settings.log_stage_timings:
+        total_ms = int((time.monotonic() - wall_start) * 1000)
+        logger.info(
+            "chat request timing",
+            extra={
+                "request_id": request_id, "cache_hit": False, "status": status, "total_ms": total_ms,
+                "cache_check_ms": stage.get("cache_check_ms"), "groq_ms": stage.get("groq_ms"),
+                "gemini_ms": stage.get("gemini_ms"), "task_queue_ms": task_queue_ms,
+            },
+        )
+
+    return response_obj
