@@ -260,8 +260,8 @@ flowchart TD
 ### 1. Clone and bootstrap
 
 ```bash
-git clone <repo-url>
-cd SentinelAI
+git clone https://github.com/arungujjar123/Sentinel-AI.git
+cd Sentinel-AI
 python scripts/bootstrap.py
 ```
 
@@ -366,7 +366,7 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 # Docker, then the repo
 curl -fsSL https://get.docker.com | sudo sh   # or the manual apt steps in Docker's docs
-git clone https://github.com/AnkitByteForge/SentinelAI.git && cd SentinelAI
+git clone https://github.com/arungujjar123/Sentinel-AI.git && cd Sentinel-AI
 
 # backend/.env — same shape as backend/.env.example, plus:
 #   PRELOAD_EMBEDDING_MODEL=false   (see note below)
