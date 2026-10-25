@@ -42,6 +42,24 @@ def _prompt_preview(messages: list[dict]) -> str | None:
     return None
 
 
+def _queue(task, **kwargs) -> int:
+    """
+    Enqueue a fire-and-forget Celery task without ever failing the request.
+
+    A broker outage must not turn an otherwise-successful response into a
+    500 — the same degrade-don't-block philosophy services/rate_limiter.py
+    and services/circuit_breaker.py already follow for Redis. Losing a log
+    row or a cache write is an acceptable cost; losing a response the
+    caller already paid a provider for is not. Returns queue time in ms.
+    """
+    start = time.monotonic()
+    try:
+        task.delay(**kwargs)
+    except Exception as e:
+        logger.error("failed to queue %s — continuing without it: %s", task.name, e)
+    return int((time.monotonic() - start) * 1000)
+
+
 async def verify_api_key(
     response: Response,
     authorization: str = Header(...),
@@ -87,8 +105,8 @@ async def verify_api_key(
             },
         )
 
-    # Fire-and-forget — never block the request on a last_used write.
-    touch_api_key_task.delay(key_hash=key_data["key_hash"])
+    # Fire-and-forget — never block (or fail) the request on a last_used write.
+    _queue(touch_api_key_task, key_hash=key_data["key_hash"])
     return key_data["id"]
 
 
@@ -162,8 +180,8 @@ async def chat(
             wall_latency = int((time.monotonic() - wall_start) * 1000)
 
             # Fire background task — don't await DB/cache writes.
-            task_start = time.monotonic()
-            post_process_task.delay(
+            task_queue_ms = _queue(
+                post_process_task,
                 request_id=request_id,
                 provider=cached["provider"],
                 model=cached["model"],
@@ -180,7 +198,6 @@ async def chat(
                 prompt_preview=prompt_prev,
                 response_preview=_truncate(cached.get("content")),
             )
-            task_queue_ms = int((time.monotonic() - task_start) * 1000)
             logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
 
             if settings.log_stage_timings:
@@ -237,8 +254,8 @@ async def chat(
 
     # ── 4. All providers failed ───────────────────────────────────────
     if result is None:
-        task_start = time.monotonic()
-        post_process_task.delay(
+        task_queue_ms = _queue(
+            post_process_task,
             request_id=request_id,
             provider="none",
             model=request.model,
@@ -255,7 +272,6 @@ async def chat(
             prompt_preview=prompt_prev,
             response_preview=None,
         )
-        task_queue_ms = int((time.monotonic() - task_start) * 1000)
         logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
 
         if settings.log_stage_timings:
@@ -291,8 +307,8 @@ async def chat(
     )
 
     # ── 6. Fire background task AFTER building response ──────────────
-    task_start = time.monotonic()
-    post_process_task.delay(
+    task_queue_ms = _queue(
+        post_process_task,
         request_id=request_id,
         provider=result["provider"],
         model=result["model"],
@@ -309,7 +325,6 @@ async def chat(
         prompt_preview=prompt_prev,
         response_preview=_truncate(result.get("content")),
     )
-    task_queue_ms = int((time.monotonic() - task_start) * 1000)
     logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
 
     if settings.log_stage_timings:

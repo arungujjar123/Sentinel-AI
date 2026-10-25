@@ -1,7 +1,7 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
-import redis as redis_client
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from app.services.cache import get_cache_stats
 from app.services.circuit_breaker import registry as cb
 from app.services.cost import get_pricing_table
 from app.services.queries import get_logs, get_metrics
+from app.services.redis_client import get_redis
 from app.services.webhook import send_webhook
 from app.worker import celery_app
 
@@ -89,25 +90,41 @@ async def circuit_states(_: str = Depends(verify_api_key)):
     return await cb.get_all_states()
 
 
+def _ping_celery_workers() -> dict:
+    """
+    Blocking Celery control broadcast — must be called via asyncio.to_thread,
+    never directly from an async handler. inspect().ping() waits out its full
+    timeout when no worker replies, which would stall the event loop (and
+    every other in-flight request) on each dashboard poll.
+    """
+    inspector = celery_app.control.inspect(timeout=1)
+    if not inspector:
+        return {}
+    return inspector.ping() or {}
+
+
 @router.get("/v1/worker/stats")
 async def worker_stats(_: str = Depends(verify_api_key)):
     """
     Returns Celery queue depth and worker status from Redis.
     Used by dashboard to show async processing health.
+
+    Uses the shared async client (settings.redis_url) rather than its own
+    sync connection to localhost — the old hardcoded host meant this
+    endpoint always reported "down" under docker-compose, where Redis is
+    reachable as `redis`, not `localhost`.
     """
     try:
-        r = redis_client.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-        r.ping()
+        r = get_redis()
+        await asyncio.wait_for(r.ping(), timeout=settings.health_redis_timeout_seconds)
 
-        inspector = celery_app.control.inspect(timeout=1)
-        if not inspector:
-            return {"status": "down", "queue_depth": 0}
-
-        ping = inspector.ping() or {}
+        ping = await asyncio.to_thread(_ping_celery_workers)
         if len(ping) == 0:
             return {"status": "down", "queue_depth": 0}
 
-        queue_depth = r.llen("celery")
+        queue_depth = await asyncio.wait_for(
+            r.llen("celery"), timeout=settings.health_redis_timeout_seconds
+        )
         return {"status": "connected", "queue_depth": queue_depth}
     except Exception:
         return {"status": "down", "queue_depth": 0}

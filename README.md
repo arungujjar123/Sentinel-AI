@@ -223,17 +223,17 @@ flowchart TD
 
 ## Benchmark results
 
-No load test has been run against this deployment yet — the table below is the schema to fill in after running one (see `backend/tests/` for where to add a load-test script; `test_gateway.py` is currently a placeholder).
+**No load test has been run against a deployment yet, so this table is unfilled.** The harness to fill it exists and is committed — see [Load testing](#load-testing) below for the three runnable scenarios (`tests/locustfile.py`, `tests/load_test.py`, `scripts/loadtest_failover.py`). Every number here is `TBD` until those runs are actually executed and the results pasted in; nothing in this table is an estimate or a projection.
 
-| Metric | Value |
-|---|---|
-| Cache hit rate | TBD |
-| Avg latency (cache hit) | TBD |
-| Avg latency (cache miss / live provider call) | TBD |
-| Latency reduction (hit vs. miss) | TBD |
-| Cost saved per 500 requests | TBD |
-| p95 latency @ 20 concurrent users | TBD |
-| Failed requests during simulated provider outage | TBD |
+| Metric | Value | Produced by |
+|---|---|---|
+| Cache hit rate | TBD | `RealisticMixUser` |
+| Avg latency (cache hit) | TBD | `RealisticMixUser` |
+| Avg latency (cache miss / live provider call) | TBD | `RealisticMixUser` |
+| Latency reduction (hit vs. miss) | TBD | `RealisticMixUser` |
+| Cost saved per 500 requests | TBD | `tests/load_test.py` |
+| p95 latency @ 20 concurrent users | TBD | `InfraStressUser` |
+| Failed requests during simulated provider outage | TBD | `scripts/loadtest_failover.py` |
 
 ## Tech stack
 
@@ -318,7 +318,7 @@ pytest
 
 ## Load testing
 
-The README's benchmark table below reflects real runs of this suite. Three scenarios, each answering a different question:
+The three scenarios below are what fill the [benchmark table](#benchmark-results) above — which is still unfilled, because these runs haven't been executed against a deployment yet. Each scenario answers a different question:
 
 **1. Realistic mix, real providers** — validates the cache/cost value proposition with real latency numbers. Kept to low concurrency to stay under Groq/Gemini's free-tier rate limits.
 
