@@ -31,8 +31,9 @@ os.environ.setdefault("LOG_LEVEL", "WARNING")
 
 from pathlib import Path  # noqa: E402
 
-from alembic import command as alembic_command  # noqa: E402
 from alembic.config import Config as AlembicConfig  # noqa: E402
+
+from alembic import command as alembic_command  # noqa: E402
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
