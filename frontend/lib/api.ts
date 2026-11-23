@@ -49,7 +49,7 @@ export const api = {
   circuits: () => request<Record<string, CircuitState>>('/v1/circuit/states'),
   worker: () => request<WorkerStats>('/v1/worker/stats'),
   chat: (content: string) =>
-    request<{ meta?: { cache_hit?: boolean } }>('/v1/chat', {
+    request<{ meta?: { cache_hit?: boolean; redactions?: number; route?: string } }>('/v1/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages: [{ role: 'user', content }], max_tokens: 150 }),

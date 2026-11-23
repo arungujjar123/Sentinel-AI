@@ -3,7 +3,8 @@
 PRICING = {
     "groq": {
         # Groq charges these rates — free tier gives credits, same calculation
-        "openai/gpt-oss-20b":     {"input": 0.075, "output": 0.30},   # per 1M tokens — current default
+        "openai/gpt-oss-20b":     {"input": 0.075, "output": 0.30},   # per 1M tokens — router's small model
+        "openai/gpt-oss-120b":    {"input": 0.15,  "output": 0.60},   # router's large model
         # Retired by Groq (kept so cost lookups on old historical rows still resolve):
         "llama-3.1-8b-instant":   {"input": 0.05,  "output": 0.08},
         "llama-3.1-70b-versatile":{"input": 0.59,  "output": 0.79},

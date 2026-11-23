@@ -3,13 +3,14 @@
 import { useState } from 'react'
 import { ArrowDown, ArrowUp, ChevronRight } from 'lucide-react'
 import { capitalize, fmtCost, fmtMs, fmtTime, shortId } from '@/lib/format'
-import { T, providerColor } from '@/lib/theme'
+import { T, providerColor, routeColor } from '@/lib/theme'
 import type { LogEntry } from '@/lib/types'
 import { Card, CardHead, Empty, StatusBadge, Tag } from './ui'
 
 type SortKey = 'latency_ms' | 'cost_usd' | 'created_at'
 
 export function statusBadge(log: LogEntry) {
+  if (log.status === 'blocked') return <StatusBadge status="critical" label="Blocked" />
   if (log.status === 'error') return <StatusBadge status="critical" label="Error" />
   if (log.fallback_from || log.status === 'fallback') return <StatusBadge status="serious" label="Fallback" />
   return <StatusBadge status="good" label="Success" />
@@ -55,6 +56,7 @@ export function LogsTable({ logs, offline, onSelect }: { logs: LogEntry[]; offli
               <option value="">All statuses</option>
               <option value="success">Success</option>
               <option value="fallback">Fallback</option>
+              <option value="blocked">Blocked</option>
               <option value="error">Error</option>
             </select>
             <select className="select" value={providerF} onChange={e => setProviderF(e.target.value)} aria-label="Filter by provider">
@@ -75,7 +77,9 @@ export function LogsTable({ logs, offline, onSelect }: { logs: LogEntry[]; offli
               <tr>
                 <th>Request</th>
                 <th>Provider</th>
+                <th>Tier</th>
                 <th>Cache</th>
+                <th>PII</th>
                 <th>Status</th>
                 <SortHead k="latency_ms" label="Latency" />
                 <SortHead k="cost_usd" label="Cost" />
@@ -97,7 +101,19 @@ export function LogsTable({ logs, offline, onSelect }: { logs: LogEntry[]; offli
                       ? <Tag color={providerColor(log.provider)} label={capitalize(log.provider)} />
                       : <span style={{ color: T.ink3 }}>—</span>}
                   </td>
-                  <td><Tag color={log.cache_hit ? T.hit : T.miss} label={log.cache_hit ? 'Hit' : 'Miss'} /></td>
+                  <td>
+                    {log.route === 'small' || log.route === 'large'
+                      ? <Tag color={routeColor(log.route)} label={capitalize(log.route)} />
+                      : <span style={{ color: T.ink3 }}>{log.route === 'pinned' ? 'Pinned' : '—'}</span>}
+                  </td>
+                  <td>
+                    {log.status === 'blocked'
+                      ? <span style={{ color: T.ink3 }}>—</span>
+                      : <Tag color={log.cache_hit ? T.hit : T.miss} label={log.cache_hit ? 'Hit' : 'Miss'} />}
+                  </td>
+                  <td className="num" title={log.redaction_types ?? undefined}>
+                    {(log.redaction_count ?? 0) > 0 ? log.redaction_count : <span style={{ color: T.ink3 }}>—</span>}
+                  </td>
                   <td>{statusBadge(log)}</td>
                   <td className="num" style={{ color: T.ink }}>{fmtMs(log.latency_ms)}</td>
                   <td className="num">{log.cache_hit ? '$0' : fmtCost(log.cost_usd)}</td>

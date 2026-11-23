@@ -4,7 +4,7 @@ import type { ReactNode } from 'react'
 
 export const metadata: Metadata = {
   title: 'SentinelAI · LLM Gateway Dashboard',
-  description: 'Live observability for an LLM gateway: provider failover, semantic caching, latency and cost per request.',
+  description: 'Live dashboard for an LLM gateway that blocks prompt injection, redacts personal data, routes by difficulty and caches semantically.',
 }
 
 export const viewport: Viewport = {

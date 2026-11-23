@@ -22,6 +22,13 @@ class RequestLog(Base):
     fallback_from = Column(String,  nullable=True)
     prompt_preview  = Column(Text,  nullable=True)
     response_preview= Column(Text,  nullable=True)
+    # Guardrails (services/guardrails.py) — see migration 0004.
+    injection_score   = Column(Float,   nullable=True)   # max over the request's user messages
+    redaction_count   = Column(Integer, nullable=False, default=0, server_default="0")
+    redaction_types   = Column(String,  nullable=True)   # e.g. "EMAIL,PERSON"
+    route             = Column(String,  nullable=True)   # small | large | pinned | default
+    router_score      = Column(Float,   nullable=True)   # P(hard) for the last user message
+    cost_if_large_usd = Column(Float,   nullable=True)   # small-routed requests: cost on the large model
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
 

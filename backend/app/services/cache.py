@@ -6,38 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import CacheEntry
 from app.services.cost import calculate_cost
-
-# ── Embedding model — loaded lazily on first use ───────────────────────
-# Not at import time: importing this module (which happens simply by
-# starting the app) must not require the model to load successfully.
-# PRELOAD_EMBEDDING_MODEL=true forces it via warmup_embedding_model() at
-# startup instead of on the first /v1/chat request.
-_model = None
+from app.services.embeddings import embed as _embed
+from app.services.embeddings import warmup as warmup_embedding_model  # noqa: F401 — kept for callers
 
 SIMILARITY_THRESHOLD = 0.92   # cosine similarity cutoff
-
-
-def _get_model():
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _model
-
-
-def warmup_embedding_model() -> bool:
-    """Force the embedding model to load now instead of on first use."""
-    try:
-        _get_model().encode("warmup", normalize_embeddings=True)
-        return True
-    except Exception:
-        return False
-
-
-def _embed(text_input: str) -> list[float]:
-    """Generate normalised 384-dim embedding."""
-    vec = _get_model().encode(text_input, normalize_embeddings=True)
-    return vec.tolist()
 
 
 def _prompt_hash(text_input: str) -> str:

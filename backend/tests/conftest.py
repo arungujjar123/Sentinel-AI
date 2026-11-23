@@ -13,16 +13,23 @@ import asyncio
 import atexit
 import os
 
-from testcontainers.postgres import PostgresContainer
+# TEST_POSTGRES_URL points the suite at an existing Postgres+pgvector
+# instead of starting a container — for machines without Docker. The
+# suite migrates it and truncates its tables before every test, so never
+# aim it at real data.
+if os.environ.get("TEST_POSTGRES_URL"):
+    os.environ["POSTGRES_URL"] = os.environ["TEST_POSTGRES_URL"]
+else:
+    from testcontainers.postgres import PostgresContainer
 
-_container = PostgresContainer(image="pgvector/pgvector:pg16")
-_container.start()
-atexit.register(_container.stop)
+    _container = PostgresContainer(image="pgvector/pgvector:pg16")
+    _container.start()
+    atexit.register(_container.stop)
 
-os.environ["POSTGRES_URL"] = (
-    f"postgresql+asyncpg://{_container.username}:{_container.password}"
-    f"@{_container.get_container_host_ip()}:{_container.get_exposed_port(5432)}/{_container.dbname}"
-)
+    os.environ["POSTGRES_URL"] = (
+        f"postgresql+asyncpg://{_container.username}:{_container.password}"
+        f"@{_container.get_container_host_ip()}:{_container.get_exposed_port(5432)}/{_container.dbname}"
+    )
 os.environ.setdefault("API_KEY", "test-master-key")
 os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
@@ -31,9 +38,8 @@ os.environ.setdefault("LOG_LEVEL", "WARNING")
 
 from pathlib import Path  # noqa: E402
 
-from alembic.config import Config as AlembicConfig  # noqa: E402
-
 from alembic import command as alembic_command  # noqa: E402
+from alembic.config import Config as AlembicConfig  # noqa: E402
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
@@ -187,12 +193,15 @@ def mock_providers(monkeypatch):
     `from x import y` binds a local name, so that's the reference that
     actually needs patching for routers.gateway to see the fake).
     """
-    state = {"groq": "success", "gemini": "success"}
+    state = {"groq": "success", "gemini": "success", "reply": None}
     calls = {"groq": 0, "gemini": 0}
+    # Every request a provider received: {"messages": [...], "model": "..."}.
+    # Lets tests check what actually left the gateway (e.g. redacted text).
+    sent = {"groq": [], "gemini": []}
 
     def _response(provider: str, model: str) -> dict:
         return {
-            "content": f"mock {provider} response",
+            "content": state["reply"] or f"mock {provider} response",
             "provider": provider,
             "model": model,
             "input_tokens": 10,
@@ -208,15 +217,17 @@ def mock_providers(monkeypatch):
 
     async def fake_call_groq(messages, model, max_tokens, temperature):
         calls["groq"] += 1
+        sent["groq"].append({"messages": messages, "model": model})
         if state["groq"] == "fail":
             raise _failure()
         return _response("groq", model)
 
-    async def fake_call_gemini(messages, max_tokens, temperature):
+    async def fake_call_gemini(messages, max_tokens, temperature, model="gemini-2.5-flash"):
         calls["gemini"] += 1
+        sent["gemini"].append({"messages": messages, "model": model})
         if state["gemini"] == "fail":
             raise _failure()
-        return _response("gemini", "gemini-2.5-flash")
+        return _response("gemini", model)
 
     monkeypatch.setattr("app.routers.gateway.call_groq", fake_call_groq)
     monkeypatch.setattr("app.routers.gateway.call_gemini", fake_call_gemini)
@@ -226,8 +237,16 @@ def mock_providers(monkeypatch):
             assert mode in ("success", "fail")
             state[provider] = mode
 
+        def reply(self, text: str) -> None:
+            """Make both providers answer with this text."""
+            state["reply"] = text
+
         @property
         def calls(self) -> dict:
             return calls
+
+        @property
+        def sent(self) -> dict:
+            return sent
 
     return Controller()

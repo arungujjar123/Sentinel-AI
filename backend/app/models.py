@@ -11,7 +11,9 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[Message]
-    model: Optional[str] = "openai/gpt-oss-20b"   # Groq default — llama-3.1-8b-instant was retired by Groq
+    # None (the default) lets the router pick the small or large model.
+    # Naming a model pins it and skips routing.
+    model: Optional[str] = None
     # Raised from 1000 — gpt-oss-20b supports up to 65,536, and callers were
     # getting truncated responses on anything moderately long. Still well
     # under Groq's free-tier 8,000 tokens/minute cap for a single request.
@@ -29,6 +31,8 @@ class MetaInfo(BaseModel):
     latency_ms: int
     provider: str
     fallback: Optional[str] = None   # original provider if fallback occurred
+    route: Optional[str] = None      # "small" | "large" | "pinned" | "default"
+    redactions: int = 0              # distinct PII values replaced before the provider call
 
 class ChatResponse(BaseModel):
     id: str
@@ -54,6 +58,11 @@ class LogEntry(BaseModel):
     fallback_from: Optional[str] = None
     prompt_preview: Optional[str] = None
     response_preview: Optional[str] = None
+    injection_score: Optional[float] = None
+    redaction_count: int = 0
+    redaction_types: Optional[str] = None
+    route: Optional[str] = None
+    router_score: Optional[float] = None
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)   # allows building from SQLAlchemy ORM objects
@@ -77,6 +86,19 @@ class LatencyStats(BaseModel):
     p99_ms: float
     avg_ms: float
 
+class GuardrailStats(BaseModel):
+    blocked_requests: int = 0                      # stopped by the injection classifier
+    redacted_requests: int = 0                     # had at least one PII value replaced
+    redactions_total: int = 0                      # distinct PII values replaced, summed
+    redacted_requests_by_type: dict[str, int] = {}  # PERSON / EMAIL / PHONE / CARD → requests
+
+class RoutingStats(BaseModel):
+    small: int = 0          # provider calls the router sent to the small model
+    large: int = 0
+    pinned: int = 0         # caller named a model, router skipped
+    default: int = 0        # routing disabled or unscored
+    saved_usd: float = 0.0  # large-model cost minus actual cost, over small-routed calls
+
 class MetricsResponse(BaseModel):
     window: str                  # "1h" | "6h" | "24h" | "7d"
     total_requests: int
@@ -87,3 +109,5 @@ class MetricsResponse(BaseModel):
     total_cost_usd: float
     latency: LatencyStats
     providers: dict[str, ProviderStats]
+    guardrails: GuardrailStats = GuardrailStats()
+    routing: RoutingStats = RoutingStats()

@@ -27,6 +27,18 @@ def _run_async(coro):
         loop.close()
 
 
+_GUARD_COLUMNS = ("injection_score", "redaction_count", "redaction_types", "route", "router_score", "cost_if_large_usd")
+
+
+def _guard_columns(fields: dict) -> dict:
+    """
+    Guardrail fields for a RequestLog row. Keys this worker doesn't know
+    are dropped rather than raising, so a task queued by a newer gateway
+    still gets logged by this worker during a rolling deploy.
+    """
+    return {k: v for k, v in fields.items() if k in _GUARD_COLUMNS and v is not None}
+
+
 # ── Task logic, as plain async functions ──────────────────────────────
 # Kept separate from the @celery_app.task wrappers below so tests can
 # await them directly on their own event loop instead of going through
@@ -49,6 +61,7 @@ async def _log_request(
     fallback_from: str | None,
     prompt_preview: str | None = None,
     response_preview: str | None = None,
+    **guard_fields,
 ):
     from app.db.database import AsyncSessionLocal
     from app.db.models import RequestLog
@@ -60,6 +73,7 @@ async def _log_request(
             cost_usd=cost_usd, latency_ms=latency_ms, cache_hit=cache_hit,
             status=status, error_type=error_type, fallback_from=fallback_from,
             prompt_preview=prompt_preview, response_preview=response_preview,
+            **_guard_columns(guard_fields),
         )
         db.add(log)
         await db.commit()
@@ -81,6 +95,7 @@ async def _post_process(
     response: dict | None,  # None for cache hits
     prompt_preview: str | None = None,
     response_preview: str | None = None,
+    **guard_fields,
 ):
     """Log to DB, then store in cache if this was a live LLM response (not a cache hit)."""
     from app.db.database import AsyncSessionLocal
@@ -94,6 +109,7 @@ async def _post_process(
             cost_usd=cost_usd, latency_ms=latency_ms, cache_hit=cache_hit,
             status=status, error_type=error_type, fallback_from=fallback_from,
             prompt_preview=prompt_preview, response_preview=response_preview,
+            **_guard_columns(guard_fields),
         )
         db.add(log)
         await db.commit()

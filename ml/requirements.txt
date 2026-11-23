@@ -1,0 +1,6 @@
+# Training-only dependencies. The gateway itself never imports these —
+# it loads the exported JSON artifacts with numpy (see
+# backend/app/services/classifiers.py).
+-r ../backend/requirements.txt
+pandas==2.3.3
+pyarrow==22.0.0
