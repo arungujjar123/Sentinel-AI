@@ -1,6 +1,6 @@
 # SentinelAI
 
-**A reliability and cost-control gateway for LLM providers — circuit-breaker failover, semantic caching, and full-request observability, sitting in front of Groq and Gemini so your application never talks to a raw provider API directly.**
+**A security and cost-control proxy between your apps and LLM providers. It strips personal data out of prompts, blocks prompt-injection attacks with a classifier trained in this repo, routes easy questions to a cheap model and hard ones to a large one with a second trained classifier, caches semantically, and fails over between Groq and Gemini, with a dashboard for cost, latency and blocked attacks.**
 
 ![Python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.136-009688?logo=fastapi&logoColor=white)
@@ -12,11 +12,31 @@
 
 **Live demo:** [Deploy URL]
 
-LLM APIs fail, rate-limit, and drift in latency in ways application code shouldn't have to know about. SentinelAI is the layer that absorbs that: every chat request goes through a semantic cache first, then a circuit-breaker-guarded provider chain (Groq primary, Gemini fallback), with cost and latency recorded on every single call. The goal isn't to make LLM calls smarter — it's to make them boring: predictable latency, bounded blast radius when a provider degrades, and a real accounting of what every request cost.
+Companies putting LLMs in production run into the same three problems: **surprise bills**, **customer data leaking** to a third-party model, and **prompt-injection attacks**. SentinelAI is the one layer every request passes through. On each request it does five things in order:
+1. redacts names, emails, phone numbers and card numbers;
+2. scores the prompt for injection and refuses attacks;
+3. picks a small or large model by how hard the prompt is;
+4. answers repeats from a semantic cache;
+5. calls a circuit-breaker-guarded provider chain (Groq, then Gemini).
+
+Cost, latency and the guardrails' decisions are recorded for every call.
+
+The two classifiers are trained here, in [`ml/`](ml/), on public datasets, with their evaluation in [`ml/README.md`](ml/README.md):
+
+| | Result on held-out data |
+|---|---|
+| Injection detector | 95.9% of attacks blocked, **1.3% false positives on real user prompts** |
+| Router | catches **62% of hard prompts while sending only 30% of traffic** to the large model (random routing: 30%) |
 
 ## The problem this solves
 
-A typical integration calls `groq.chat.completions.create(...)` directly from the request handler. Three things happen in production that don't happen in the demo:
+A typical integration calls `groq.chat.completions.create(...)` directly from the request handler. Several things happen in production that don't happen in the demo:
+
+**Customer data leaves the company.** A support tool pastes a ticket into the prompt: name, email, phone number, sometimes a card number. All of it is now in a third party's logs.
+
+**Someone types "ignore your instructions".** A user, or a document the app summarises, tells the model to drop its system prompt, reveal hidden instructions or act outside its role. Nothing stands between that text and the model.
+
+**Every question pays large-model prices.** "What are your opening hours?" and "design our sharding strategy" go to the same model at the same price, because there's only one model configured.
 
 **A provider has a bad day.** Groq returns 503s for ten minutes during a capacity event. Every request that hits it now waits out the full timeout before failing — your p99 latency goes from 2s to 20s, and every one of those calls returns an error to the end user. There is no fallback path because the code never had one.
 
@@ -24,9 +44,33 @@ A typical integration calls `groq.chat.completions.create(...)` directly from th
 
 **Nobody can answer "why was it slow yesterday."** When latency spikes or a provider starts erroring, there's no per-request record of which provider handled it, how long it took, whether it fell back, or what it cost — just application logs that weren't built to answer infrastructure questions.
 
-SentinelAI addresses all three with one gateway: cache what's already been asked, fail over when a provider is down, and log enough about every request to answer the "why" after the fact.
+SentinelAI handles all of these in one gateway:
+- remove personal data before it leaves;
+- refuse injection attempts;
+- pay for the large model only when the prompt needs it;
+- cache what's already been asked;
+- fail over when a provider is down;
+- log enough about every request to answer the "why" after the fact.
 
 ## What SentinelAI does
+
+**PII redaction** (`services/redaction.py`) runs before anything else touches the prompt.
+- **What it finds:** names via spaCy NER (`en_core_web_lg`), emails by regex, card numbers (13–19 digits that pass the Luhn checksum, so order numbers aren't caught), and phone numbers.
+- **What it sends instead:** each distinct value becomes a stable placeholder such as `[PERSON_1]`. The model, the cache and the request log only ever see placeholders.
+- **What the caller gets back:** `restore()` puts the real values back into the answer. The mapping lives in memory for the length of the request.
+- **Side effect:** two customers asking the same templated question produce the same redacted prompt, so they share one cache entry, and each still gets their own name back.
+
+**Prompt-injection detection** (`services/guardrails.py`, trained by `ml/train_injection.py`) scores every user message in the request, not just the last one. It is an ensemble of three logistic regressions: over the MiniLM sentence embedding the cache already computes, over word TF-IDF and over character TF-IDF. Above the threshold the request gets HTTP 400 before any cache or model call, and is logged as `blocked`.
+- The threshold is set to block ≤1% of real user prompts.
+- The first version blocked 22% of real user prompts while showing 1.3% false positives on its own test split; [`ml/README.md`](ml/README.md) covers how that was found and fixed.
+
+**Difficulty-based model routing** (trained by `ml/train_router.py`) labels each request small or large using RouteLLM data: a prompt is hard when a Mixtral-class model's answer was graded ≤3/5 by GPT-4.
+- **Easy prompts** go to `openai/gpt-oss-20b`, **hard ones** to `openai/gpt-oss-120b`, and the Gemini fallback keeps the same tier.
+- A caller that names a model is never re-routed.
+- Each small-routed request logs what the large model would have cost, so the dashboard reports real savings rather than an estimate.
+- `ROUTER_THRESHOLD` trades cost against quality at runtime.
+
+**Both classifiers ship as JSON** (weights, threshold, TF-IDF vocabulary), not pickle. The training scripts fail if the gateway's loader doesn't reproduce their scores exactly.
 
 **Multi-provider routing with circuit breaker failover** — Every `/v1/chat` request tries Groq first. If Groq is unavailable (timeout, 5xx, or its circuit is already open), the request transparently retries against Gemini before ever reaching the caller. Each provider has its own in-memory circuit (`services/circuit_breaker.py`): three consecutive failures trips it to `OPEN` for 60 seconds, after which one test request is allowed through (`HALF_OPEN`) to probe recovery. Outcome: a provider outage degrades to "slower, served by the other provider" instead of "every request fails."
 
@@ -36,7 +80,15 @@ SentinelAI addresses all three with one gateway: cache what's already been asked
 
 **Real-time cost tracking per request** — Every response carries `usage.cost_usd`, computed from actual input/output token counts against a per-model pricing table (`services/cost.py`). Cache hits report `$0.00` and accrue against `saved_cost_usd` on the cache entry instead. Outcome: cost is a first-class field on every logged request, not an estimate reconstructed later from provider invoices.
 
-**Observability dashboard with latency, cache, and provider health** — The Next.js dashboard polls `/v1/metrics`, `/v1/logs`, `/v1/cache/stats`, `/v1/circuit/states`, and `/v1/worker/stats` every 15 seconds and renders p50/p95/p99 latency, cache hit/miss ratio, per-provider request share and error rate, live circuit breaker state, and a per-request pipeline trace (cache check → provider call → response). Outcome: an operator can see a provider degrading or a circuit opening within 15 seconds, without grepping logs.
+**Dashboard: cost, latency and blocked attacks.** The Next.js dashboard polls the gateway every 15 seconds and shows:
+- attacks blocked and PII redacted, by type;
+- the small/large routing split and what routing saved;
+- p50/p95/p99 latency;
+- cache hit rate and cache savings;
+- per-provider share and error rate, and live circuit-breaker state;
+- a per-request pipeline trace (auth → guardrails → cache → model → response), with each request's injection score and router P(hard).
+
+Its "Run live demo" button sends a normal question, one containing personal data and an injection attempt, so every guardrail can be seen working.
 
 **Intelligent provider health scoring** — Circuit state isn't just up/down: `CircuitBreakerRegistry` tracks a rolling failure count and last-failure timestamp per provider and exposes it at `/v1/circuit/states` and `/health`, so routing decisions and dashboard alerts are driven by the same source of truth.
 
@@ -58,7 +110,11 @@ flowchart TD
 
     %% ==================== GATEWAY ====================
     subgraph GW["Gateway Layer · FastAPI"]
-        Auth["verify_api_key<br/>Bearer token check"] --> CacheCheck["check_cache()"]
+        Auth["verify_api_key<br/>Bearer token check"] --> Redact["Redact PII<br/>names · emails · phones · cards"]
+        Redact --> Inject{"Injection classifier<br/>score ≥ threshold?"}
+        Inject -->|yes| Blocked["400 · logged as blocked"]
+        Inject -->|no| Route["Router classifier<br/>easy → small · hard → large"]
+        Route --> CacheCheck["check_cache()<br/>on the redacted prompt"]
     end
 
     %% ==================== CACHE ====================
@@ -86,17 +142,17 @@ flowchart TD
 
         GroqCB{"Groq circuit<br/>CLOSED / HALF_OPEN?"}
 
-        GroqCB -->|yes| GroqCall["Call Groq<br/>openai/gpt-oss-20b"]
+        GroqCB -->|yes| GroqCall["Call Groq<br/>gpt-oss-20b or gpt-oss-120b"]
 
         GroqCB -->|no - OPEN| GeminiCB
 
-        GroqCall -->|success| Success["Build ChatResponse"]
+        GroqCall -->|success| Success["Build ChatResponse<br/>restore placeholders"]
 
         GroqCall -->|failure| RecordFail["record_failure('groq')"]
 
         RecordFail --> GeminiCB{"Gemini circuit<br/>CLOSED / HALF_OPEN?"}
 
-        GeminiCB -->|yes| GeminiCall["Call Gemini<br/>gemini-2.5-flash"]
+        GeminiCB -->|yes| GeminiCall["Call Gemini<br/>2.5-flash-lite or 2.5-flash"]
 
         GeminiCB -->|no - OPEN| AllDown["503 - all providers unavailable"]
 
@@ -309,10 +365,10 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-`tests/conftest.py` spins up a real Postgres+pgvector container via `testcontainers` (needs Docker) and runs `alembic upgrade head` against it before any test runs, so integration tests exercise the real schema — not a mock. Redis is faked (`fakeredis`), and Groq/Gemini calls are monkeypatched (`conftest.mock_providers`) so the suite has no external dependencies or cost.
+`tests/conftest.py` spins up a real Postgres+pgvector container via `testcontainers` (needs Docker; or set `TEST_POSTGRES_URL` to an existing Postgres+pgvector database you don't mind being truncated) and runs `alembic upgrade head` against it before any test runs, so integration tests exercise the real schema — not a mock. Redis is faked (`fakeredis`), and Groq/Gemini calls are monkeypatched (`conftest.mock_providers`) so the suite has no external dependencies or cost.
 
-- `tests/unit/` — circuit breaker state transitions (and that webhooks fire only on `CLOSED→OPEN`/`→CLOSED`, not every failure), rate limiter windowing and Redis-down degradation, API key hashing/rotation/cache invalidation, cost calculation, webhook HMAC signing, health check status rollup rules.
-- `tests/integration/` — `/v1/chat` (cache hit/miss, provider fallback, all-down, auth, rate limiting), `/v1/keys` CRUD + rotation, `/v1/circuit/*`, `/health*`, `/v1/webhook/*` — all through the real HTTP layer via `httpx.ASGITransport`.
+- `tests/unit/` — PII redaction (Luhn filtering, placeholder stability, restore, allowlist, NER-less fallback), circuit breaker state transitions (and that webhooks fire only on `CLOSED→OPEN`/`→CLOSED`, not every failure), rate limiter windowing and Redis-down degradation, API key hashing/rotation/cache invalidation, cost calculation, webhook HMAC signing, health check status rollup rules.
+- `tests/integration/` — guardrails end to end with the real classifiers and NER model (attacks blocked before any provider call; PII absent from what the provider, cache and log receive; placeholders restored for the caller; routing tier and pinning; metrics), `/v1/chat` (cache hit/miss, provider fallback, all-down, auth, rate limiting), `/v1/keys` CRUD + rotation, `/v1/circuit/*`, `/health*`, `/v1/webhook/*` — all through the real HTTP layer via `httpx.ASGITransport`.
 
 `ruff check .` lints the same way CI does. Both run automatically in `.github/workflows/ci.yml` on every push/PR — the CI job needs no external services either, for the same reason (testcontainers + fakeredis).
 
@@ -417,7 +473,7 @@ All endpoints except `/health`, `/health/live`, and `/health/ready` require `Aut
 
 ### `POST /v1/chat`
 
-Send a chat request through the gateway (cache → Groq → Gemini).
+Send a chat request through the gateway (redact → injection check → route → cache → Groq → Gemini).
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat \
@@ -425,7 +481,6 @@ curl -X POST http://localhost:8000/v1/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "Explain Redis in one sentence"}],
-    "model": "openai/gpt-oss-20b",
     "max_tokens": 200,
     "temperature": 0.7
   }'
@@ -438,11 +493,23 @@ curl -X POST http://localhost:8000/v1/chat \
   "provider": "groq",
   "model": "openai/gpt-oss-20b",
   "usage": {"input_tokens": 14, "output_tokens": 19, "cost_usd": 0.0000023},
-  "meta": {"cache_hit": false, "latency_ms": 812, "provider": "groq", "fallback": null}
+  "meta": {"cache_hit": false, "latency_ms": 812, "provider": "groq", "fallback": null,
+           "route": "small", "redactions": 0}
 }
 ```
 
-Optional `"bypass_cache": true` skips the semantic cache check.
+- Leave `model` out and the router picks the small or the large model (`meta.route`). Name a model to pin it; `meta.route` is then `"pinned"`.
+- `meta.redactions` counts the distinct PII values replaced before the provider call. Placeholders in the answer are already swapped back to the original values.
+- Optional `"bypass_cache": true` skips the semantic cache check.
+
+A prompt the injection classifier flags is refused before any model call:
+
+```json
+HTTP 400
+{"detail": {"error": "prompt_injection_detected",
+            "message": "This request was blocked because it looks like a prompt-injection attempt.",
+            "score": 0.997, "request_id": "..."}}
+```
 
 ### `GET /v1/logs`
 
@@ -476,9 +543,14 @@ curl "http://localhost:8000/v1/metrics?window=1h" \
   "cache_hit_rate": 0.31,
   "total_cost_usd": 0.000841,
   "latency": {"p50_ms": 22, "p95_ms": 1980, "p99_ms": 2410, "avg_ms": 640},
-  "providers": {"groq": {"requests": 37, "errors": 1, "avg_latency_ms": 710.4, "error_rate": 0.027}}
+  "providers": {"groq": {"requests": 37, "errors": 1, "avg_latency_ms": 710.4, "error_rate": 0.027}},
+  "guardrails": {"blocked_requests": 3, "redacted_requests": 5, "redactions_total": 9,
+                 "redacted_requests_by_type": {"PERSON": 4, "EMAIL": 2, "PHONE": 2, "CARD": 1}},
+  "routing": {"small": 8, "large": 4, "pinned": 0, "default": 0, "saved_usd": 0.000056}
 }
 ```
+
+`routing` counts only requests that called a provider (not cache hits, blocked or failed requests). `saved_usd` is what those small-routed calls would have cost on the large model, minus what they did cost. `cache_hit_rate` leaves blocked requests out of its denominator.
 
 ### `GET /v1/cache/stats`
 
@@ -573,7 +645,7 @@ SentinelAI/
 ├── backend/
 │   ├── alembic/
 │   │   ├── env.py                    # Async-engine-aware migration runner, reads Settings.postgres_url
-│   │   └── versions/                 # 0001_api_keys, 0002_requests_cache (+ HNSW index) — full schema
+│   │   └── versions/                 # 0001 api_keys, 0002 requests + cache (+ HNSW), 0003 tz, 0004 guardrail columns
 │   ├── alembic.ini
 │   ├── app/
 │   │   ├── main.py                   # FastAPI app: lifespan, CORS, routers, /health, /health/live, /health/ready
@@ -582,6 +654,7 @@ SentinelAI/
 │   │   ├── models.py                  # Pydantic request/response schemas (ChatRequest, MetricsResponse, ...)
 │   │   ├── worker.py                   # Celery app instance + broker/backend config (from Settings)
 │   │   ├── tasks.py                   # Celery tasks: post_process, touch_api_key, send_webhook
+│   │   ├── artifacts/                 # Trained classifiers as JSON (injection, router) — written by ml/
 │   │   ├── db/
 │   │   │   ├── database.py            # Async engine, session factory, init_db() (extension only — Alembic owns schema)
 │   │   │   └── models.py              # SQLAlchemy models: RequestLog, CacheEntry, ApiKey
@@ -590,8 +663,12 @@ SentinelAI/
 │   │   │   ├── keys.py                # /v1/keys/* — API key management (master-key auth)
 │   │   │   └── observability.py       # /v1/logs, /v1/metrics, /v1/cache/*, /v1/circuit/*, /v1/webhook/*
 │   │   └── services/
+│   │       ├── guardrails.py          # Per-request redaction → injection check → routing decision
+│   │       ├── redaction.py           # PII detection (spaCy NER + regex + Luhn), placeholders, restore()
+│   │       ├── classifiers.py         # Loads the JSON classifier artifacts and scores with them
+│   │       ├── embeddings.py          # Shared MiniLM sentence embedding (cache + both classifiers)
 │   │       ├── providers.py           # Groq + Gemini HTTP clients (shared httpx.AsyncClient)
-│   │       ├── cache.py               # Embedding (lazy-loaded), hash/vector cache lookup, cache store, stats
+│   │       ├── cache.py               # Hash/vector cache lookup, cache store, stats
 │   │       ├── circuit_breaker.py     # Redis-backed CLOSED/OPEN/HALF_OPEN state + webhook triggers
 │   │       ├── cost.py                # Static pricing table + calculate_cost()
 │   │       ├── queries.py             # get_logs() / get_metrics() aggregation queries
@@ -601,9 +678,9 @@ SentinelAI/
 │   │       ├── health.py              # Concurrent DB/Redis/Celery/provider health checks
 │   │       └── redis_client.py        # Shared async Redis client
 │   ├── tests/
-│   │   ├── conftest.py                # testcontainers Postgres + fakeredis + mocked providers
-│   │   ├── unit/                      # circuit breaker, rate limiter, api keys, cost, webhook, health
-│   │   ├── integration/                # /v1/chat, /v1/keys, /health*, /v1/circuit/*, /v1/webhook/* via HTTP
+│   │   ├── conftest.py                # testcontainers (or TEST_POSTGRES_URL) Postgres + fakeredis + mocked providers
+│   │   ├── unit/                      # redaction, circuit breaker, rate limiter, api keys, cost, webhook, health
+│   │   ├── integration/                # guardrails, /v1/chat, /v1/keys, /health*, /v1/circuit/*, /v1/webhook/* via HTTP
 │   │   ├── mock_provider.py            # Stand-in Groq/Gemini for load testing (latency/failure injection)
 │   │   ├── locustfile.py               # RealisticMixUser, InfraStressUser load-test scenarios
 │   │   └── load_test.py                # Standalone single-run benchmark script (no Locust needed)
@@ -615,11 +692,19 @@ SentinelAI/
 │   ├── Dockerfile                      # Multi-stage, non-root
 │   ├── .dockerignore
 │   └── .env.example
+├── ml/
+│   ├── train_injection.py               # Trains the prompt-injection detector → backend/app/artifacts/
+│   ├── train_router.py                  # Trains the easy/hard router → backend/app/artifacts/
+│   ├── common.py                        # Dataset download, cached embedding, export + serving-parity check
+│   ├── reports/                         # Metrics from the last training run (JSON)
+│   └── README.md                        # Data, method, results, and known failure modes
 ├── frontend/
 │   ├── app/
-│   │   ├── page.tsx                    # Dashboard — metrics, logs, cache, circuit breakers, pipeline trace
+│   │   ├── page.tsx                    # Dashboard — data fetching and layout
 │   │   ├── layout.tsx
-│   │   └── api/gateway/[...path]/route.ts  # Server-side proxy — injects the API key, browser never sees it
+│   │   └── api/gateway/[...path]/route.ts  # Server-side proxy — injects the API key, allowlists read-only routes
+│   ├── components/                      # KPI row, guardrails, routing, latency, circuits, pipeline, cache, logs
+│   ├── lib/                             # API client, types, formatters, colour tokens
 │   ├── next.config.js                   # No rewrites — the route handler above replaces that
 │   ├── Dockerfile                       # Multi-stage, non-root
 │   ├── .dockerignore
@@ -650,7 +735,16 @@ Set in `backend/.env` (see `backend/.env.example`).
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated browser origins allowed to call the API |
 | `GROQ_BASE_URL` / `GEMINI_BASE_URL` | No | real provider endpoints | Override to point at `tests/mock_provider.py` for load testing |
 | `LOG_LEVEL` | No | `INFO` | Standard Python logging level; all logs are JSON lines to stdout |
-| `PRELOAD_EMBEDDING_MODEL` | No | `false` | If `true`, loads the SentenceTransformer model at process startup instead of on first use |
+| `PRELOAD_EMBEDDING_MODEL` | No | `false` | If `true`, loads the embedding model, NER model and both classifiers at process startup instead of on first use |
+| `INJECTION_DETECTION_ENABLED` | No | `true` | Block requests the injection classifier flags |
+| `INJECTION_THRESHOLD` | No | trained value | Probability threshold override for blocking (higher = fewer blocks) |
+| `REDACTION_ENABLED` | No | `true` | Redact PII before the cache, providers and logs |
+| `REDACTION_NER_MODEL` | No | `en_core_web_lg` | spaCy model for name detection; `en_core_web_md` is lighter, at some recall cost |
+| `REDACTION_ALLOWED_NAMES` | No | `""` | Comma-separated names never redacted (public figures, product names, NER false positives) |
+| `ROUTING_ENABLED` | No | `true` | Route requests that don't name a model by predicted difficulty |
+| `ROUTER_THRESHOLD` | No | trained value | Probability threshold for the large model (lower = more large-model traffic, higher quality and cost) |
+| `GROQ_SMALL_MODEL` / `GROQ_LARGE_MODEL` | No | `openai/gpt-oss-20b` / `openai/gpt-oss-120b` | Groq model per tier |
+| `GEMINI_SMALL_MODEL` / `GEMINI_LARGE_MODEL` | No | `gemini-2.5-flash-lite` / `gemini-2.5-flash` | Gemini fallback model per tier |
 | `LOG_STAGE_TIMINGS` | No | `false` | If `true`, logs per-stage timing breakdowns (`cache_check_ms`, `groq_ms`, `gemini_ms`, ...) for each `/v1/chat` call |
 
 See `backend/.env.example` for the full list, including the API key cache TTL, default per-key rate limit, circuit-breaker webhook config, and health-check timeouts — every one of them now lives in `Settings` (`app/config.py`) rather than being hardcoded in a service file.

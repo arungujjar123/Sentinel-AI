@@ -2,8 +2,8 @@
 
 import { useEffect, useRef } from 'react'
 import { ArrowRight, X } from 'lucide-react'
-import { capitalize, fmtCost, fmtInt, fmtMs } from '@/lib/format'
-import { T, providerColor } from '@/lib/theme'
+import { capitalize, fmtCost, fmtInt, fmtMs, fmtPct } from '@/lib/format'
+import { T, providerColor, routeColor } from '@/lib/theme'
 import type { LogEntry } from '@/lib/types'
 import { Tag } from './ui'
 import { statusBadge } from './LogsTable'
@@ -33,7 +33,12 @@ export function LogModal({ log, onClose }: { log: LogEntry; onClose: () => void 
             </h2>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
               {statusBadge(log)}
-              <Tag color={log.cache_hit ? T.hit : T.miss} label={log.cache_hit ? 'Cache hit' : 'Cache miss'} />
+              {log.status !== 'blocked' && (
+                <Tag color={log.cache_hit ? T.hit : T.miss} label={log.cache_hit ? 'Cache hit' : 'Cache miss'} />
+              )}
+              {(log.route === 'small' || log.route === 'large') && (
+                <Tag color={routeColor(log.route)} label={`${capitalize(log.route)} model`} />
+              )}
               {hasProvider && <Tag color={providerColor(log.provider)} label={capitalize(log.provider)} />}
             </div>
           </div>
@@ -48,6 +53,9 @@ export function LogModal({ log, onClose }: { log: LogEntry; onClose: () => void 
           <div><dt>Cost</dt><dd className="num">{log.cache_hit ? '$0 (cached)' : fmtCost(log.cost_usd)}</dd></div>
           <div><dt>Input tokens</dt><dd className="num">{fmtInt(log.input_tokens)}</dd></div>
           <div><dt>Output tokens</dt><dd className="num">{fmtInt(log.output_tokens)}</dd></div>
+          <div><dt>Injection risk</dt><dd className="num">{log.injection_score == null ? '—' : fmtPct(log.injection_score, 1)}</dd></div>
+          <div><dt>Router P(hard)</dt><dd className="num">{log.router_score == null ? '—' : fmtPct(log.router_score, 1)}</dd></div>
+          <div><dt>PII redacted</dt><dd>{(log.redaction_count ?? 0) > 0 ? `${log.redaction_count} (${(log.redaction_types ?? '').toLowerCase().replace(/,/g, ', ')})` : 'None'}</dd></div>
           <div><dt>Time (UTC)</dt><dd className="num mono" style={{ fontSize: 12 }}>{new Date(log.created_at).toISOString().replace('T', ' ').slice(0, 19)}</dd></div>
         </dl>
 
@@ -67,7 +75,7 @@ export function LogModal({ log, onClose }: { log: LogEntry; onClose: () => void 
         )}
 
         <div style={{ marginTop: 16 }}>
-          <div className="preview-label">Prompt</div>
+          <div className="preview-label">Prompt{(log.redaction_count ?? 0) > 0 ? ' (as sent to the model, PII redacted)' : ''}</div>
           <div className="preview">{prompt || <span style={{ color: T.ink3 }}>Not stored for this request</span>}</div>
         </div>
         <div style={{ marginTop: 12 }}>

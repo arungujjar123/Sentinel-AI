@@ -95,12 +95,13 @@ def _convert_to_gemini_format(messages: list[dict]) -> tuple[str, list[dict]]:
 
     return system_prompt, contents
 
-async def call_gemini(messages: list[dict], max_tokens: int, temperature: float) -> dict:
-    """Call Gemini 2.5 Flash (free tier). Returns normalized response dict."""
+async def call_gemini(
+    messages: list[dict], max_tokens: int, temperature: float, model: str = "gemini-2.5-flash",
+) -> dict:
+    """Call a Gemini model (free tier). Returns normalized response dict."""
     if not settings.gemini_api_key:
         raise ValueError("Missing GEMINI_API_KEY")
     start = time.monotonic()
-    model = "gemini-2.5-flash"
     system_prompt, contents = _convert_to_gemini_format(messages)
 
     payload = {

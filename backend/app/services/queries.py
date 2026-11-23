@@ -77,6 +77,7 @@ async def get_metrics(db: AsyncSession, window: str = "24h") -> dict:
         return _empty_metrics(window)
 
     total = len(rows)
+    blocked     = [r for r in rows if r.status == "blocked"]
     successful  = [r for r in rows if r.status == "success"]
     failed      = [r for r in rows if r.status == "error"]
     fallbacks   = [r for r in rows if r.status == "fallback"]
@@ -113,7 +114,8 @@ async def get_metrics(db: AsyncSession, window: str = "24h") -> dict:
         "successful_requests":  len(successful),
         "failed_requests":      len(failed),
         "fallback_requests":    len(fallbacks),
-        "cache_hit_rate":       round(len(cache_hits) / total, 4) if total else 0.0,
+        # Blocked requests never reach the cache, so they're left out of the denominator.
+        "cache_hit_rate":       round(len(cache_hits) / (total - len(blocked)), 4) if total > len(blocked) else 0.0,
         "total_cost_usd":       round(sum(r.cost_usd for r in rows), 6),
         "latency": {
             "p50_ms":  percentile(latencies, 50),
@@ -122,7 +124,43 @@ async def get_metrics(db: AsyncSession, window: str = "24h") -> dict:
             "avg_ms":  round(statistics.mean(latencies), 1),
         },
         "providers": providers,
+        "guardrails": _guardrail_stats(rows, blocked),
+        "routing": _routing_stats(rows),
     }
+
+
+def _guardrail_stats(rows: list, blocked: list) -> dict:
+    redacted = [r for r in rows if (r.redaction_count or 0) > 0]
+    by_type: dict[str, int] = {}
+    for r in redacted:
+        for kind in (r.redaction_types or "").split(","):
+            if kind:
+                by_type[kind] = by_type.get(kind, 0) + 1
+    return {
+        "blocked_requests":   len(blocked),
+        "redacted_requests":  len(redacted),
+        "redactions_total":   sum(r.redaction_count for r in redacted),
+        "redacted_requests_by_type": by_type,
+    }
+
+
+def _routing_stats(rows: list) -> dict:
+    """
+    Tier split over requests that actually called a provider (cache hits,
+    blocked and failed requests never used the routed model), plus what
+    sending small-routed requests to the small model saved versus the
+    large one.
+    """
+    served = [r for r in rows if not r.cache_hit and r.status in ("success", "fallback")]
+    counts = {tier: 0 for tier in ("small", "large", "pinned", "default")}
+    for r in served:
+        counts[r.route if r.route in counts else "default"] += 1
+    saved = sum(
+        r.cost_if_large_usd - r.cost_usd
+        for r in served
+        if r.route == "small" and r.cost_if_large_usd is not None
+    )
+    return {**counts, "saved_usd": round(max(saved, 0.0), 6)}
 
 
 def _empty_metrics(window: str) -> dict:
@@ -136,4 +174,7 @@ def _empty_metrics(window: str) -> dict:
         "total_cost_usd": 0.0,
         "latency": {"p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "avg_ms": 0.0},
         "providers": {},
+        "guardrails": {"blocked_requests": 0, "redacted_requests": 0, "redactions_total": 0,
+                       "redacted_requests_by_type": {}},
+        "routing": {"small": 0, "large": 0, "pinned": 0, "default": 0, "saved_usd": 0.0},
     }

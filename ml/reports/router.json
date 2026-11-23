@@ -1,0 +1,109 @@
+{
+  "model": "mean logit of logreg on MiniLM embeddings + word 1-2gram TF-IDF",
+  "label_rule": "hard = small-model answer graded <= 3/5",
+  "threshold_logit": -0.5262,
+  "threshold_rule": "lowest-cost threshold with validation hard-prompt recall >= 80%",
+  "split_sizes": {
+    "train": 50000,
+    "val": 5000,
+    "test": 5000
+  },
+  "test_hard_rate": 0.1352,
+  "test_roc_auc": 0.7632,
+  "test_roc_auc_by_component": {
+    "embedding": 0.7266,
+    "word": 0.7565
+  },
+  "test_at_threshold": {
+    "n": 5000,
+    "positives": 676,
+    "roc_auc": 0.7632,
+    "precision": 0.2214,
+    "recall": 0.8254,
+    "f1": 0.3492,
+    "false_positive_rate": 0.4537,
+    "share_to_large": 0.504
+  },
+  "test_tradeoff": [
+    {
+      "to_large": 0.1,
+      "hard_caught": 0.3077
+    },
+    {
+      "to_large": 0.2,
+      "hard_caught": 0.4941
+    },
+    {
+      "to_large": 0.3,
+      "hard_caught": 0.6228
+    },
+    {
+      "to_large": 0.4,
+      "hard_caught": 0.7337
+    },
+    {
+      "to_large": 0.5,
+      "hard_caught": 0.824
+    },
+    {
+      "to_large": 0.6,
+      "hard_caught": 0.8831
+    },
+    {
+      "to_large": 0.7,
+      "hard_caught": 0.9305
+    }
+  ],
+  "probes": [
+    {
+      "text": "What is the capital of France?",
+      "expected": "easy",
+      "routed": "small",
+      "probability_hard": 0.167
+    },
+    {
+      "text": "Translate 'thank you' into Spanish.",
+      "expected": "easy",
+      "routed": "large",
+      "probability_hard": 0.417
+    },
+    {
+      "text": "Give me three synonyms for 'happy'.",
+      "expected": "easy",
+      "routed": "large",
+      "probability_hard": 0.378
+    },
+    {
+      "text": "Fix the grammar: 'he go to school yesterday'.",
+      "expected": "easy",
+      "routed": "large",
+      "probability_hard": 0.472
+    },
+    {
+      "text": "Prove that there are infinitely many primes p such that p \u2261 3 (mod 4).",
+      "expected": "hard",
+      "routed": "large",
+      "probability_hard": 0.444
+    },
+    {
+      "text": "Write a thread-safe LRU cache in Rust with O(1) get/put and explain the ownership model.",
+      "expected": "hard",
+      "routed": "large",
+      "probability_hard": 0.513
+    },
+    {
+      "text": "Design a database schema and indexing strategy for a multi-tenant SaaS billing system with usage-based pricing.",
+      "expected": "hard",
+      "routed": "small",
+      "probability_hard": 0.216
+    },
+    {
+      "text": "A train leaves at 3pm at 80 km/h and another at 4pm at 100 km/h from the same station. When does the second overtake the first, and how far out?",
+      "expected": "hard",
+      "routed": "large",
+      "probability_hard": 0.655
+    }
+  ],
+  "artifact_bytes": 1548888,
+  "serving_parity_max_logit_diff": 1.02473295909844e-06
+}

@@ -6,6 +6,7 @@ import type { CacheStats, CircuitState, Connection, LogEntry, Metrics, TimeWindo
 import { CachePanel } from '@/components/CachePanel'
 import { CircuitPanel } from '@/components/CircuitPanel'
 import { ConnectionBanner } from '@/components/ConnectionBanner'
+import { GuardrailsPanel } from '@/components/GuardrailsPanel'
 import { Header } from '@/components/Header'
 import { KpiRow } from '@/components/KpiRow'
 import { LatencyChart } from '@/components/LatencyChart'
@@ -13,6 +14,7 @@ import { LogModal } from '@/components/LogModal'
 import { LogsTable } from '@/components/LogsTable'
 import { PipelinePanel } from '@/components/PipelinePanel'
 import { ProviderPanel } from '@/components/ProviderPanel'
+import { RoutingPanel } from '@/components/RoutingPanel'
 
 const REFRESH_MS = 15_000
 
@@ -75,6 +77,11 @@ export default function Dashboard() {
         {connection.state === 'offline' && <ConnectionBanner message={connection.message} />}
 
         <KpiRow metrics={metrics} logs={logs} cache={cache} offline={offline} />
+
+        <div className="row-1-1">
+          <GuardrailsPanel metrics={metrics} logs={logs} offline={offline} />
+          <RoutingPanel metrics={metrics} offline={offline} />
+        </div>
 
         <div className="row-2-1">
           <LatencyChart logs={logs} offline={offline} />

@@ -2,8 +2,9 @@
 // props). Keep in sync with the matching tokens in app/globals.css.
 //
 // Series pairs were checked with the dataviz palette validator against the
-// card surface (#12151a, dark mode): both pairs pass lightness band, chroma
-// floor, CVD separation (worst ΔE 26.8 / 17.3) and 3:1 contrast.
+// card surface (#12151a, dark mode): all three pairs (groq/gemini,
+// hit/miss, small/large) pass lightness band, chroma floor, CVD separation
+// (worst ΔE 26.8 / 17.3 / 13.2) and 3:1 contrast.
 export const T = {
   surface: '#12151a',
   grid:    '#232830',
@@ -17,6 +18,8 @@ export const T = {
   gemini:  '#d95926',
   hit:     '#199e70',
   miss:    '#9085e9',
+  small:   '#c98500',
+  large:   '#d55181',
 
   // Status — reserved for meaning, always paired with an icon + label.
   good:     '#0ca30c',
@@ -28,5 +31,11 @@ export const T = {
 export function providerColor(name: string): string {
   if (name === 'groq') return T.groq
   if (name === 'gemini') return T.gemini
+  return T.ink3
+}
+
+export function routeColor(route: string | null | undefined): string {
+  if (route === 'small') return T.small
+  if (route === 'large') return T.large
   return T.ink3
 }

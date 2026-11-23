@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     await init_db()      # creates DB tables on startup
     if settings.preload_embedding_model:
-        from app.services.cache import warmup_embedding_model
+        from app.services import guardrails
+        from app.services.embeddings import warmup as warmup_embeddings
 
         # Run in a worker thread to avoid blocking the event loop.
-        await asyncio.to_thread(warmup_embedding_model)
+        await asyncio.to_thread(warmup_embeddings)
+        logger.info("guardrails loaded: %s", await asyncio.to_thread(guardrails.warmup))
 
     try:
         yield

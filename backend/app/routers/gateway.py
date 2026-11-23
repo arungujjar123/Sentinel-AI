@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import uuid
@@ -9,11 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db.database import get_db
 from app.models import ChatRequest, ChatResponse, MetaInfo, UsageInfo
+from app.services import guardrails
 from app.services.api_keys import resolve_key
 from app.services.cache import check_cache
-from app.services.circuit_breaker import registry as cb  # ← new
+from app.services.circuit_breaker import registry as cb
+from app.services.cost import calculate_cost
 from app.services.providers import call_gemini, call_groq
 from app.services.rate_limiter import limiter
+from app.services.redaction import restore
 
 # Import Celery tasks (fire-and-forget post-processing)
 from app.tasks import post_process_task, touch_api_key_task
@@ -155,22 +159,58 @@ async def _try_provider(name: str, fn) -> dict | None:
         return None
 
 
+def _log_timing(request_id: str, wall_start: float, stage: dict, **extra) -> None:
+    if settings.log_stage_timings:
+        logger.info("chat request timing", extra={
+            "request_id": request_id, "total_ms": int((time.monotonic() - wall_start) * 1000), **stage, **extra,
+        })
+
+
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
     _: str = Depends(verify_api_key),
 ):
-    messages    = [m.model_dump() for m in request.messages]
-    request_id  = str(uuid.uuid4())
-    wall_start  = time.monotonic()
+    raw_messages = [m.model_dump() for m in request.messages]
+    request_id = str(uuid.uuid4())
+    wall_start = time.monotonic()
     stage: dict[str, int] = {}
-    prompt_prev = _prompt_preview(messages)
-    fallback_from: str | None = None
-    status: str = "success"
-    error_type: str | None = None
 
-    # ── 1. Semantic cache check ───────────────────────────────────────
+    # ── 1. Guardrails: redact PII, score injection, pick a model tier ─
+    # Everything after this point — cache, providers, logs — only ever
+    # sees the redacted messages.
+    t_guard = time.monotonic()
+    guard = await asyncio.to_thread(guardrails.inspect, raw_messages, request.model)
+    stage["guard_ms"] = int((time.monotonic() - t_guard) * 1000)
+    messages = guard.messages
+    mapping = guard.redaction.mapping
+    prompt_prev = _prompt_preview(messages)
+    log_common = {"messages": messages, "prompt_preview": prompt_prev, **guard.log_fields()}
+
+    if guard.blocked:
+        stage["task_queue_ms"] = _queue(
+            post_process_task,
+            request_id=request_id, provider="none", model=request.model or "none",
+            input_tokens=0, output_tokens=0, cost_usd=0.0,
+            latency_ms=int((time.monotonic() - wall_start) * 1000),
+            cache_hit=False, status="blocked", error_type="prompt_injection", fallback_from=None,
+            response=None, response_preview=None, **log_common,
+        )
+        _log_timing(request_id, wall_start, stage, status="blocked")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "prompt_injection_detected",
+                "message": "This request was blocked because it looks like a prompt-injection attempt.",
+                "score": round(guard.injection_score or 0.0, 3),
+                "request_id": request_id,
+            },
+        )
+
+    meta_extra = {"route": guard.route, "redactions": guard.redaction.total}
+
+    # ── 2. Semantic cache (keyed on the redacted prompt) ──────────────
     if not request.bypass_cache:
         t_cache = time.monotonic()
         cached = await check_cache(db=db, messages=messages)
@@ -178,164 +218,105 @@ async def chat(
 
         if cached:
             wall_latency = int((time.monotonic() - wall_start) * 1000)
-
-            # Fire background task — don't await DB/cache writes.
-            task_queue_ms = _queue(
+            stage["task_queue_ms"] = _queue(
                 post_process_task,
-                request_id=request_id,
-                provider=cached["provider"],
-                model=cached["model"],
-                input_tokens=cached["input_tokens"],
-                output_tokens=cached["output_tokens"],
-                cost_usd=0.0,
-                latency_ms=wall_latency,
-                cache_hit=True,
-                status="success",
-                error_type=None,
-                fallback_from=None,
-                messages=messages,
-                response=None,  # no response to cache — already cached
-                prompt_preview=prompt_prev,
+                request_id=request_id, provider=cached["provider"], model=cached["model"],
+                input_tokens=cached["input_tokens"], output_tokens=cached["output_tokens"],
+                cost_usd=0.0, latency_ms=wall_latency, cache_hit=True,
+                status="success", error_type=None, fallback_from=None,
+                response=None,  # nothing to cache — already cached
                 response_preview=_truncate(cached.get("content")),
+                **log_common,
             )
-            logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
-
-            if settings.log_stage_timings:
-                total_ms = int((time.monotonic() - wall_start) * 1000)
-                logger.info(
-                    "chat request timing",
-                    extra={
-                        "request_id": request_id, "cache_hit": True, "total_ms": total_ms,
-                        "cache_check_ms": stage.get("cache_check_ms"), "task_queue_ms": task_queue_ms,
-                    },
-                )
-
+            _log_timing(request_id, wall_start, stage, cache_hit=True)
             return ChatResponse(
-                id=request_id, content=cached["content"],
+                id=request_id, content=restore(cached["content"], mapping),
                 provider=cached["provider"], model=cached["model"],
                 usage=UsageInfo(input_tokens=cached["input_tokens"],
                                 output_tokens=cached["output_tokens"],
                                 cost_usd=0.0),
                 meta=MetaInfo(cache_hit=True, latency_ms=wall_latency,
-                              provider=cached["provider"], fallback=None),
+                              provider=cached["provider"], fallback=None, **meta_extra),
             )
 
-    # ── 2. Try Groq (with circuit breaker) ───────────────────────────
-    result = None
+    # ── 3. Groq on the routed (or pinned) model, circuit-breaker guarded
+    fallback_from: str | None = None
+    status = "success"
+    groq_model = guardrails.groq_model(guard, request.model)
 
     t_groq = time.monotonic()
     result = await _try_provider(
         "groq",
         lambda: call_groq(
-            messages=messages, model=request.model,
+            messages=messages, model=groq_model,
             max_tokens=request.max_tokens, temperature=request.temperature,
-        )
+        ),
     )
     stage["groq_ms"] = int((time.monotonic() - t_groq) * 1000)
 
-    if result:
-        status = "success"
-
-    # ── 3. Try Gemini if Groq failed or was open ──────────────────────
+    # ── 4. Gemini, same tier, if Groq failed or its circuit is open ───
     if result is None:
         fallback_from = "groq"
         t_gemini = time.monotonic()
         result = await _try_provider(
             "gemini",
             lambda: call_gemini(
-                messages=messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-            )
+                messages=messages, max_tokens=request.max_tokens,
+                temperature=request.temperature, model=guardrails.gemini_model(guard),
+            ),
         )
         stage["gemini_ms"] = int((time.monotonic() - t_gemini) * 1000)
         if result:
             status = "fallback"
 
-    # ── 4. All providers failed ───────────────────────────────────────
+    # ── 5. All providers failed ───────────────────────────────────────
     if result is None:
-        task_queue_ms = _queue(
+        stage["task_queue_ms"] = _queue(
             post_process_task,
-            request_id=request_id,
-            provider="none",
-            model=request.model,
-            input_tokens=0,
-            output_tokens=0,
-            cost_usd=0.0,
+            request_id=request_id, provider="none", model=groq_model,
+            input_tokens=0, output_tokens=0, cost_usd=0.0,
             latency_ms=int((time.monotonic() - wall_start) * 1000),
-            cache_hit=False,
-            status="error",
-            error_type="all_providers_failed",
-            fallback_from=fallback_from,
-            messages=messages,
-            response=None,
-            prompt_preview=prompt_prev,
-            response_preview=None,
+            cache_hit=False, status="error", error_type="all_providers_failed",
+            fallback_from=fallback_from, response=None, response_preview=None,
+            **log_common,
         )
-        logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
-
-        if settings.log_stage_timings:
-            total_ms = int((time.monotonic() - wall_start) * 1000)
-            logger.info(
-                "chat request timing",
-                extra={
-                    "request_id": request_id, "cache_hit": False, "status": "error", "total_ms": total_ms,
-                    "cache_check_ms": stage.get("cache_check_ms"), "groq_ms": stage.get("groq_ms"),
-                    "gemini_ms": stage.get("gemini_ms"), "task_queue_ms": task_queue_ms,
-                },
-            )
+        _log_timing(request_id, wall_start, stage, status="error")
         circuit_states = await cb.get_all_states()
         raise HTTPException(
             status_code=503,
-            detail={
-                "error": "All providers unavailable",
-                "circuit_states": circuit_states,
-            }
+            detail={"error": "All providers unavailable", "circuit_states": circuit_states},
         )
 
     wall_latency = int((time.monotonic() - wall_start) * 1000)
 
-    # ── 5. Return response FIRST ─────────────────────────────────────
+    # What this request would have cost on the large model — the basis
+    # for "saved by routing" in /v1/metrics.
+    cost_if_large = None
+    if guard.route == "small":
+        large = guardrails.large_model_for(result["provider"])
+        if large:
+            cost_if_large = calculate_cost(result["provider"], large, result["input_tokens"], result["output_tokens"])
+
+    # ── 6. Respond first; log + cache in the background ───────────────
+    # The cache stores the provider's placeholder text (no PII); only this
+    # caller's response gets the original values put back.
     response_obj = ChatResponse(
-        id=request_id, content=result["content"],
+        id=request_id, content=restore(result["content"], mapping),
         provider=result["provider"], model=result["model"],
         usage=UsageInfo(input_tokens=result["input_tokens"],
                         output_tokens=result["output_tokens"],
                         cost_usd=result["cost_usd"]),
         meta=MetaInfo(cache_hit=False, latency_ms=wall_latency,
-                      provider=result["provider"], fallback=fallback_from),
+                      provider=result["provider"], fallback=fallback_from, **meta_extra),
     )
-
-    # ── 6. Fire background task AFTER building response ──────────────
-    task_queue_ms = _queue(
+    stage["task_queue_ms"] = _queue(
         post_process_task,
-        request_id=request_id,
-        provider=result["provider"],
-        model=result["model"],
-        input_tokens=result["input_tokens"],
-        output_tokens=result["output_tokens"],
-        cost_usd=result["cost_usd"],
-        latency_ms=wall_latency,
-        cache_hit=False,
-        status=status,
-        error_type=error_type,
-        fallback_from=fallback_from,
-        messages=messages,
-        response=result,
-        prompt_preview=prompt_prev,
-        response_preview=_truncate(result.get("content")),
+        request_id=request_id, provider=result["provider"], model=result["model"],
+        input_tokens=result["input_tokens"], output_tokens=result["output_tokens"],
+        cost_usd=result["cost_usd"], latency_ms=wall_latency, cache_hit=False,
+        status=status, error_type=None, fallback_from=fallback_from,
+        response=result, response_preview=_truncate(result.get("content")),
+        cost_if_large_usd=cost_if_large, **log_common,
     )
-    logger.debug("task queued", extra={"request_id": request_id, "task_queue_ms": task_queue_ms})
-
-    if settings.log_stage_timings:
-        total_ms = int((time.monotonic() - wall_start) * 1000)
-        logger.info(
-            "chat request timing",
-            extra={
-                "request_id": request_id, "cache_hit": False, "status": status, "total_ms": total_ms,
-                "cache_check_ms": stage.get("cache_check_ms"), "groq_ms": stage.get("groq_ms"),
-                "gemini_ms": stage.get("gemini_ms"), "task_queue_ms": task_queue_ms,
-            },
-        )
-
+    _log_timing(request_id, wall_start, stage, status=status)
     return response_obj

@@ -26,6 +26,8 @@
   --gemini: #d95926;
   --hit:    #199e70;
   --miss:   #9085e9;
+  --small:  #c98500;
+  --large:  #d55181;
 
   --good:     #0ca30c;
   --warning:  #fab219;
@@ -77,8 +79,14 @@ button:focus-visible, select:focus-visible, [role='button']:focus-visible, tr:fo
   gap: var(--gap);
 }
 
+.row-1-1 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap);
+}
+
 @media (max-width: 960px) {
-  .row-2-1 { grid-template-columns: minmax(0, 1fr); }
+  .row-2-1, .row-1-1 { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 640px) {
@@ -270,7 +278,8 @@ button:focus-visible, select:focus-visible, [role='button']:focus-visible, tr:fo
 .kv dd { margin: 2px 0 0; color: var(--ink); font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
 
 /* ── Pipeline ─────────────────────────────────────────────────────── */
-.pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.pipeline { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 1100px) { .pipeline { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 640px) { .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .step {
   position: relative;
@@ -282,7 +291,7 @@ button:focus-visible, select:focus-visible, [role='button']:focus-visible, tr:fo
 .step[data-active='false'] { opacity: 0.45; }
 .step-n { color: var(--ink-3); font-size: 11px; font-weight: 500; }
 .step-label { color: var(--ink); font-size: 13px; font-weight: 600; margin-top: 2px; }
-.step-detail { color: var(--ink-2); font-size: 12px; margin-top: 2px; display: flex; align-items: center; gap: 6px; }
+.step-detail { color: var(--ink-2); font-size: 12px; margin-top: 2px; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 
 /* ── Lists (circuits, providers, top prompts) ─────────────────────── */
 .list { display: flex; flex-direction: column; gap: 8px; }
@@ -303,6 +312,12 @@ button:focus-visible, select:focus-visible, [role='button']:focus-visible, tr:fo
 .share-track { height: 8px; border-radius: 4px; background: var(--page); overflow: hidden; }
 .share-track > span { display: block; height: 100%; border-radius: 4px; }
 
+/* ── Bar list (one series per row) ────────────────────────────────── */
+.bars { display: flex; flex-direction: column; gap: 10px; }
+.bar-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) 40px; align-items: center; gap: 10px; font-size: 13px; }
+.bar-row .label { color: var(--ink-2); }
+.bar-row .value { color: var(--ink); text-align: right; }
+
 /* ── Table ────────────────────────────────────────────────────────── */
 .filters { display: flex; gap: 8px; flex-wrap: wrap; }
 .select {
@@ -318,7 +333,7 @@ button:focus-visible, select:focus-visible, [role='button']:focus-visible, tr:fo
 
 .table-wrap { overflow: auto; max-height: 520px; margin: 0 -20px -20px; border-top: 1px solid var(--border); }
 @media (max-width: 640px) { .table-wrap { margin: 0 -16px -16px; } }
-.table { width: 100%; min-width: 680px; border-collapse: collapse; }
+.table { width: 100%; min-width: 860px; border-collapse: collapse; }
 .table th {
   position: sticky; top: 0; z-index: 1;
   background: var(--surface);
